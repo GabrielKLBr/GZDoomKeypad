@@ -1,0 +1,10 @@
+Sprite KPAPA0, 740, 493
+{
+ Offset 370, 493
+ Patch "graphics/paper.png", 0, 0
+}
+Sprite KPANA0, 718, 928
+{
+ Offset 359, 928
+ Patch "graphics/wall.png", 0, 0
+}

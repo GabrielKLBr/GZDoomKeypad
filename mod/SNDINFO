@@ -1,0 +1,5 @@
+gk/paper "sounds/paper.mp3"
+gk/press "sounds/keypadpress.mp3"
+gk/open "sounds/keypadopen.mp3"
+$limit gk/press 0
+gk/buzz "sounds/buzz.mp3"

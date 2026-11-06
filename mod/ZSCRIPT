@@ -1,0 +1,597 @@
+version "4.14"
+class GKDoor : Object
+{
+ int Code, Color, Tag, SectorIndex;
+ bool Unlocked;
+ Array<int> Lines;
+ Array<int> Sectors, Accesses;
+ Array<Actor> Panels;
+}
+class GKPaper : Inventory
+{
+ int PaperColor;
+ property PaperColor: PaperColor;
+ Default
+ {
+  Inventory.PickupMessage "Voce encontrou uma folha com codigos.";
+  Inventory.PickupSound "none";
+  +INVENTORY.AUTOACTIVATE
+  +INVENTORY.ALWAYSPICKUP
+  Scale 0.045;
+ }
+ override bool Use(bool pickup)
+ {
+  if (!Owner || !Owner.player) return false;
+  let h=GKHandler(EventHandler.Find('GKHandler'));
+  if(h) h.Collect(Owner.PlayerNumber(),PaperColor);
+  return true;
+ }
+ States { Spawn: KPAP A -1; Stop; }
+}
+class GKBluePaper : GKPaper replaces BlueCard { Default { GKPaper.PaperColor 0; } }
+class GKYellowPaper : GKPaper replaces YellowCard { Default { GKPaper.PaperColor 1; } }
+class GKRedPaper : GKPaper replaces RedCard { Default { GKPaper.PaperColor 2; } }
+class GKBlueSkullPaper : GKPaper replaces BlueSkull { Default { GKPaper.PaperColor 0; } }
+class GKYellowSkullPaper : GKPaper replaces YellowSkull { Default { GKPaper.PaperColor 1; } }
+class GKRedSkullPaper : GKPaper replaces RedSkull { Default { GKPaper.PaperColor 2; } }
+class GKPanel : Actor
+{
+ int MountLine, MountSector, AccessSector, EntranceLine;
+ Default { Radius 4; Height 21; Scale 0.022284; +NOGRAVITY +NOBLOCKMAP +WALLSPRITE }
+ States { Spawn: KPAN A -1; Stop; }
+}
+class GKHandler : EventHandler
+{
+ Array<GKDoor> Doors;
+ Array<int> LineDoor;
+ Array<int> PaperOrder;
+ Array<int> FloorMotion, CeilingMotion;
+ int Known[3];
+ int Cooldown;
+ bool PreviousUse;
+ override void WorldLoaded(WorldEvent e)
+ {
+  if(e.IsSaveGame || e.IsReopen) return;
+  for(int i=0;i<level.lines.Size();i++) LineDoor.Push(-1);
+  for(int i=0;i<level.lines.Size();i++)
+  {
+   let ln=level.lines[i];
+   int key=ln.locknumber;
+   if(ln.special==13) key=ln.args[3];
+   if(ln.special==202) key=ln.args[4];
+   int color=KeyColor(key);
+   if(color<0) continue;
+   if(ln.special!=13 && ln.special!=202 && ln.locknumber==0) continue;
+   int tag=ln.args[0], sec=ln.backsector ? ln.backsector.Index() : -1;
+   int index=-1;
+   for(int j=0;j<Doors.Size();j++)
+    if(Doors[j].Color==color && ((tag!=0 && Doors[j].Tag==tag) ||
+      (tag==0 && Doors[j].Tag==0 && sec>=0 && Doors[j].SectorIndex==sec))) {index=int(j);break;}
+   if(index<0)
+   {
+    let d=new('GKDoor'); d.Color=color; d.Tag=tag; d.SectorIndex=sec;
+    bool duplicate;
+    do {
+     d.Code=Random[GKCodes](0,9999); duplicate=false;
+     for(int j=0;j<Doors.Size();j++) if(Doors[j].Code==d.Code) duplicate=true;
+    } while(duplicate);
+    index=int(Doors.Size()); Doors.Push(d);
+   }
+   Doors[index].Lines.Push(i); LineDoor[i]=index;
+   ln.locknumber=0;
+   if(ln.special==13) ln.args[3]=0;
+   if(ln.special==202) ln.args[4]=0;
+
+  }
+  // Shuffle the note independently of the randomly generated per-door passwords.
+  for(int i=0;i<Doors.Size();i++) PaperOrder.Push(i);
+  for(int i=PaperOrder.Size()-1;i>0;i--)
+  {
+   int j=Random[GKPaperOrder](0,i);
+   int temp=PaperOrder[i];PaperOrder[i]=PaperOrder[j];PaperOrder[j]=temp;
+  }
+  for(int i=0;i<Doors.Size();i++) ResolveDoorSectors(i);
+  BuildMovingSectorCache();
+  for(int i=0;i<Doors.Size();i++) BuildDoorPanels(i);
+ }
+ int KeyColor(int key)
+ {
+  if(key==1 || key==4 || key==129) return 2;
+  if(key==2 || key==5 || key==130) return 0;
+  if(key==3 || key==6 || key==131) return 1;
+  return -1;
+ }
+ bool HasDoorSector(int index,int sectorIndex)
+ {
+  for(int i=0;i<Doors[index].Sectors.Size();i++)
+   if(Doors[index].Sectors[i]==sectorIndex) return true;
+  return false;
+ }
+ bool IsDoorVolume(int sectorIndex)
+ {
+  for(int i=0;i<Doors.Size();i++) if(HasDoorSector(i,sectorIndex)) return true;
+  return false;
+ }
+ void ResolveDoorSectors(int index)
+ {
+  let d=Doors[index];
+  if(d.Tag!=0)
+  {
+   let it=level.CreateSectorTagIterator(d.Tag);
+   int sec;
+   while((sec=it.Next())>=0) if(!HasDoorSector(index,sec)) d.Sectors.Push(sec);
+  }
+  else if(d.SectorIndex>=0) d.Sectors.Push(d.SectorIndex);
+ }
+ void AddDoorAccess(int index,Line entrance,int side)
+ {
+  Sector room=side==0?entrance.frontsector:entrance.backsector;
+  if(!room || HasDoorSector(index,room.Index())) return;
+  Vector2 center=(entrance.v1.p+entrance.v2.p)*0.5;
+  if(room.ceilingplane.ZatPoint(center)-room.floorplane.ZatPoint(center)<48) return;
+  int key=entrance.Index()*2+side;
+  for(int i=0;i<Doors[index].Accesses.Size();i++) if(Doors[index].Accesses[i]==key) return;
+  Doors[index].Accesses.Push(key);
+  // A plain reverse-side Door_Raise must not bypass the keypad.
+  if(LineDoor[entrance.Index()]<0 && ((entrance.special>=10 && entrance.special<=14) || entrance.special==202))
+   LineDoor[entrance.Index()]=index;
+  PlacePanel(index,entrance,side);
+ }
+ void BuildDoorPanels(int index)
+ {
+  let d=Doors[index];
+  // Preserve remote locked switches as interaction points.
+  for(int i=0;i<d.Lines.Size();i++)
+  {
+   let ln=level.lines[d.Lines[i]];
+   AddDoorAccess(index,ln,0);
+   if(ln.backsector) AddDoorAccess(index,ln,1);
+  }
+  // The other entrance is another LINE around the closed door volume.
+  for(int i=0;i<d.Sectors.Size();i++)
+  {
+   let volume=level.sectors[d.Sectors[i]];
+   for(int j=0;j<volume.lines.Size();j++)
+   {
+    let ln=volume.lines[j];
+    if(ln.frontsector==volume && ln.backsector) AddDoorAccess(index,ln,1);
+    else if(ln.backsector==volume && ln.frontsector) AddDoorAccess(index,ln,0);
+   }
+  }
+ }
+ Vector2 ClosestOnLine(Line ln,Vector2 point)
+ {
+  double len=ln.delta.Length();
+  if(len<0.001) return ln.v1.p;
+  Vector2 dir=ln.delta/len,offset=point-ln.v1.p;
+  return ln.v1.p+dir*clamp(offset.x*dir.x+offset.y*dir.y,0.,len);
+ }
+ bool MovesFloor(int specialId)
+ {
+  switch(specialId) {
+   case 20: case 21: case 22: case 23: case 24: case 25: case 26: case 27: case 28: case 31: case 32: case 35: case 36: case 37: case 46: case 60: case 61: case 62: case 63: case 64: case 65: case 66: case 67: case 68: case 95: case 96: case 99: case 138: case 172: case 200: case 203: case 204: case 206: case 207: case 217: case 228: case 230: case 231: case 235: case 236: case 238: case 239: case 240: case 241: case 242: case 245: case 246: case 247: case 250: case 251: case 256: case 257: case 258: case 259: case 260: case 261: case 270: case 271: case 272: case 273: case 275: case 279: return true;
+   default: return false;
+  }
+ }
+ bool MovesCeiling(int specialId)
+ {
+  switch(specialId) {
+   case 10: case 11: case 12: case 13: case 14: case 38: case 40: case 41: case 42: case 43: case 44: case 45: case 47: case 69: case 95: case 96: case 97: case 104: case 105: case 106: case 168: case 169: case 192: case 193: case 194: case 195: case 196: case 197: case 198: case 199: case 201: case 202: case 205: case 245: case 246: case 247: case 249: case 251: case 252: case 253: case 254: case 255: case 262: case 263: case 264: case 265: case 266: case 267: case 268: case 269: case 274: case 276: case 280: case 284: return true;
+   default: return false;
+  }
+ }
+ void MarkMotion(int index,bool floor,bool ceiling)
+ {
+  if(floor) FloorMotion[index]=1;
+  if(ceiling) CeilingMotion[index]=1;
+ }
+ void BuildMovingSectorCache()
+ {
+  for(int i=0;i<level.sectors.Size();i++) {FloorMotion.Push(0);CeilingMotion.Push(0);}
+  for(int i=0;i<Doors.Size();i++)
+   for(int j=0;j<Doors[i].Sectors.Size();j++) CeilingMotion[Doors[i].Sectors[j]]=1;
+  for(int i=0;i<level.lines.Size();i++)
+  {
+   let ln=level.lines[i];
+   bool floor=MovesFloor(ln.special),ceiling=MovesCeiling(ln.special);
+   if(!floor && !ceiling) continue;
+   if(ln.args[0]>0)
+   {
+    let it=level.CreateSectorTagIterator(ln.args[0]);
+    int index;
+    while((index=it.Next())>=0) MarkMotion(index,floor,ceiling);
+   }
+   else if(ln.backsector) MarkMotion(ln.backsector.Index(),floor,ceiling);
+  }
+  for(int tag=666;tag<=667;tag++)
+  {
+   let it=level.CreateSectorTagIterator(tag);
+   int index;
+   while((index=it.Next())>=0) MarkMotion(index,true,true);
+  }
+ }
+ bool IsMovingFloor(int index) {return index>=0 && index<FloorMotion.Size() && FloorMotion[index]!=0;}
+ bool IsMovingCeiling(int index) {return index>=0 && index<CeilingMotion.Size() && CeilingMotion[index]!=0;}
+ bool IsMovingSector(int index) {return IsMovingFloor(index) || IsMovingCeiling(index);}
+ bool HasWallSurface(Line wall,Sector room,Vector2 point,double base)
+ {
+  if(wall.locknumber>0 || (wall.special!=0 && LineDoor[wall.Index()]<0 && wall.activation!=0)) return false;
+  bool front=wall.frontsector==room;
+  if(!front && wall.backsector!=room) return false;
+  let face=wall.sidedef[front?0:1];
+  if(!face || (face.Flags & Side.WALLF_POLYOBJ)) return false;
+  Sector other=front?wall.backsector:wall.frontsector;
+  if(!other) return true;
+  if(other==room) return false;
+  if(other.floorplane.ZatPoint(point)>=base+21)
+   return !IsMovingFloor(other.Index()) && face.GetTexture(Side.bottom).IsValid();
+  if(other.ceilingplane.ZatPoint(point)<=base)
+   return !IsMovingCeiling(other.Index()) && face.GetTexture(Side.top).IsValid();
+  return false;
+ }
+ Vector3 SidePointOnLine(Line ln,Vector2 origin,Vector2 inward,double margin,double normalOffset)
+ {
+  double length=ln.delta.Length();
+  if(length<0.001) return (0,0,-1);
+  Vector2 dir=ln.delta/length;
+  Vector2 start=ln.v1.p+(dir.y,-dir.x)*normalOffset-origin;
+  double slope=dir.x*inward.x+dir.y*inward.y;
+  double initial=start.x*inward.x+start.y*inward.y;
+  double low=margin,high=length-margin;
+  if(abs(slope)<0.000001)
+  {
+   if(initial < -0.5) return (0,0,-1);
+  }
+  else
+  {
+   double crossing=(0.25-initial)/slope;
+   if(slope>0) low=max(low,crossing);else high=min(high,crossing);
+  }
+  if(low>high) return (0,0,-1);
+  Vector2 offset=origin-ln.v1.p;
+  double along=clamp(offset.x*dir.x+offset.y*dir.y,low,high);
+  Vector2 point=ln.v1.p+dir*along;
+  return (point.x,point.y,1);
+ }
+ void PlacePanel(int index,Line door,int side)
+ {
+  Sector access=side==0?door.frontsector:door.backsector;
+  if(!access) return;
+  Vector2 center=(door.v1.p+door.v2.p)*0.5;
+  double toward=atan2(door.delta.y,door.delta.x)+(side==0?-90:90);
+  Vector2 inward=(cos(toward),sin(toward));
+  if(access.ceilingplane.ZatPoint(center)-access.floorplane.ZatPoint(center)<48) return;
+  Vector2 bestPos;
+  double bestAngle=0,bestScore=1e30,bestWidth=16;
+  int bestLine=-1,bestRoom=-1;
+  Array<int> rooms;
+  rooms.Push(access.Index());
+  for(int cursor=0;cursor<rooms.Size();cursor++)
+  {
+   let room=level.sectors[rooms[cursor]];
+   for(int j=0;j<room.lines.Size();j++)
+   {
+    let wall=room.lines[j];
+    double length=wall.delta.Length();
+    if(length>=8)
+    {
+     Vector2 dir=wall.delta/length;
+     bool front=wall.frontsector==room;
+     Vector3 candidate=SidePointOnLine(wall,center,inward,min(18.,length*0.5),front?0.25:-0.25);
+     if(candidate.z>0)
+     {
+      Vector2 onwall=candidate.xy;
+      double base=room.floorplane.ZatPoint(onwall)+24;
+      if(room.ceilingplane.ZatPoint(onwall)>=base+21 && HasWallSurface(wall,room,onwall,base))
+      {
+       double angle=atan2(dir.y,dir.x)+(front?-90:90);
+       Vector2 pos=onwall+(cos(angle),sin(angle))*0.25,relative=pos-center;
+       double score=relative.Length();
+       double width=length>=16?16:length-0.5;
+       bool better=bestLine<0 || (bestWidth<16 && width>=16) || ((bestWidth<16)==(width<16) && score<bestScore);
+       if(better && level.PointInSector(pos)==room)
+       {
+        bestPos=pos;bestAngle=angle;bestScore=score;bestLine=wall.Index();bestRoom=room.Index();bestWidth=width;
+       }
+      }
+     }
+    }
+    if(!wall.backsector || (wall.flags & Line.ML_BLOCKING)) continue;
+    Sector other=wall.frontsector==room?wall.backsector:wall.frontsector;
+    if(!other || other==room || IsDoorVolume(other.Index())) continue;
+    Vector3 candidate=SidePointOnLine(wall,center,inward,0,0);
+    if(candidate.z<0) continue;
+    Vector2 portal=candidate.xy,relative=portal-center;
+    if(relative.Length()>512) continue;
+    double f1=room.floorplane.ZatPoint(portal),f2=other.floorplane.ZatPoint(portal);
+    double top=min(room.ceilingplane.ZatPoint(portal),other.ceilingplane.ZatPoint(portal));
+    if(top-max(f1,f2)<48 || abs(f1-f2)>(level.IsJumpingAllowed()?48:24)) continue;
+    bool seen=false;
+    for(int k=0;k<rooms.Size();k++) if(rooms[k]==other.Index()) {seen=true;break;}
+    if(!seen) rooms.Push(other.Index());
+   }
+  }
+  if(bestLine<0) return;
+  for(int k=0;k<Doors[index].Panels.Size();k++)
+  {
+   let existing=GKPanel(Doors[index].Panels[k]);
+   if(existing.AccessSector==access.Index() && cos(existing.Angle-bestAngle)>0.99 &&
+      (existing.Pos.xy-bestPos).Length()<24) return;
+  }
+  let room=level.sectors[bestRoom];
+  let p=GKPanel(Actor.Spawn('GKPanel',(bestPos.x,bestPos.y,room.floorplane.ZatPoint(bestPos)+24),NO_REPLACE));
+  if(p)
+  {
+   p.Scale=p.Scale*(bestWidth/16.0);p.Height=928*p.Scale.y;
+   p.Angle=bestAngle;p.MountLine=bestLine;p.MountSector=bestRoom;p.AccessSector=access.Index();p.EntranceLine=door.Index();
+   Doors[index].Panels.Push(p);
+  }
+ }
+ void Collect(int p,int color)
+ {
+  Known[color]=1;
+  EventHandler.SendInterfaceEvent(p,"gkpaper",color);
+ }
+ void Open(int p,int index)
+ {
+  if(Cooldown>0) return;
+  Cooldown=12;
+  EventHandler.SendInterfaceEvent(p,"gkpad",index);
+ }
+ override void WorldLinePreActivated(WorldEvent e)
+ {
+  int n=e.ActivatedLine.Index();
+  if(n<0 || n>=int(LineDoor.Size())) return;
+  int d=LineDoor[n];
+  if(d<0 || Doors[d].Unlocked) return;
+  e.ShouldActivate=false;
+  // The panel is the interaction target. Direct use of the door stays locked.
+ }
+ override void WorldTick()
+ {
+  if(Cooldown>0) Cooldown--;
+  let p=players[0].mo;
+  if(!p || p.health<=0) return;
+  bool use=(players[0].cmd.buttons & BT_USE)!=0;
+  if(use && !PreviousUse)
+  {
+   for(int i=0;i<Doors.Size();i++)
+    for(int j=0;j<Doors[i].Panels.Size();j++)
+    {
+     let a=Doors[i].Panels[j];
+     if(!a || p.Distance2D(a)>80 || !p.CheckSight(a)) continue;
+     double yaw=cos(p.Angle-p.AngleTo(a));
+     if(yaw>0.766044443) {Open(0,int(i));PreviousUse=use;return;}
+    }
+  }
+  PreviousUse=use;
+ }
+ override void NetworkProcess(ConsoleEvent e)
+ {
+  if(e.Name!="gksubmit" || e.Player!=0) return;
+  int n=e.Args[0];
+  if(n<0 || n>=Doors.Size()) return;
+  let d=Doors[n];
+  let p=players[e.Player].mo;
+  if(!p || p.health<=0) return;
+  bool near=false;
+  for(int j=0;j<d.Panels.Size();j++)
+   if(d.Panels[j] && p.Distance2D(d.Panels[j])<96 && p.CheckSight(d.Panels[j])) near=true;
+  // Validate against this door only, never against all codes of the same color.
+  if(!near || e.Args[1]!=d.Code)
+  {
+   EventHandler.SendInterfaceEvent(e.Player,"gkdenied",n);
+   return;
+  }
+  d.Unlocked=true;
+  let ln=level.lines[d.Lines[0]];
+  if(level.ExecuteSpecial(ln.special,p,ln,false,ln.args[0],ln.args[1],ln.args[2],ln.args[3],ln.args[4]))
+   EventHandler.SendInterfaceEvent(e.Player,"gkopened",n);
+  else EventHandler.SendInterfaceEvent(e.Player,"gkdenied",n);
+ }
+ override void InterfaceProcess(ConsoleEvent e)
+ {
+  if(e.Name=="gkopened" || e.Name=="gkdenied")
+  {
+   bool success=e.Name=="gkopened";
+   S_StartSound(success?"gk/open":"gk/buzz",CHAN_AUTO,CHANF_UI|CHANF_NOPAUSE,1,ATTN_NONE);
+   let active=GKMenu(Menu.GetCurrentMenu());
+   if(active && !active.Paper && active.Selection==e.Args[0])
+   {
+    active.Submitting=false;
+    if(success) active.Blink=18;
+    else {active.Digits="";active.Pressed=-1;active.Close();}
+   }
+   return;
+  }
+  if(e.Name!="gkpaper" && e.Name!="gkpad") return;
+  if(e.Name=="gkpaper") S_StartSound("gk/paper",CHAN_AUTO,CHANF_UI|CHANF_NOPAUSE,1,ATTN_NONE);
+  if(Menu.GetCurrentMenu()) return;
+  let m=new('GKMenu');
+  m.Init(null);
+  m.Handler=self;
+  m.Paper=e.Name=="gkpaper";
+  m.Selection=e.Args[0];
+  m.Pressed=-1;
+  m.DontDim=true; m.DontBlur=true;
+  m.ActivateMenu();
+  if(!m.Paper) menuactive=Menu.OnNoPause;
+ }
+}
+class GKMenu : Menu
+{
+ GKHandler Handler;
+ bool Paper;
+ int Selection, Pressed, Blink, TapBlink, Page;
+ bool MouseHeld, Submitting;
+ String Digits;
+ double X,Y,S;
+ void Layout()
+ {
+  S=min(screen.GetWidth()*0.65/718.,screen.GetHeight()*0.65/928.);
+  X=(screen.GetWidth()-718*S)*0.5;Y=(screen.GetHeight()-928*S)*0.5;
+ }
+ void Image(String path,double x,double y,double w,double h)
+ {
+  Screen.DrawTexture(TexMan.CheckForTexture(path),false,x,y,DTA_DestWidthF,w,DTA_DestHeightF,h,DTA_NoOffset,true);
+ }
+ void Label(String text,double x,double y,double scale,int color=Font.CR_BLACK)
+ {
+  Screen.DrawText(Font.GetFont('GKFont'),color,x,y,text,DTA_ScaleX,scale,DTA_ScaleY,scale);
+ }
+ void Sheet(int color,double x,double y,double w,double h,bool preview=false)
+ {
+  Image("graphics/paper.png",x,y,w,h);
+  Array<String> codes;
+  for(int i=0;i<Handler.Doors.Size();i++)
+  {
+   int index=Handler.PaperOrder.Size()==Handler.Doors.Size()?Handler.PaperOrder[i]:i;
+   if(Handler.Doors[index].Color==color) codes.Push(String.Format("%04d",Handler.Doors[index].Code));
+  }
+  int per=4;
+  int pages=max(1,(codes.Size()+per-1)/per);
+  int page=Page%pages;
+  int first=page*per,rows=min(per,codes.Size()-first);
+  if(rows>0)
+  {
+   let font=Font.GetFont('GKFont');
+   double widest=1;
+   for(int i=0;i<rows;i++) widest=max(widest,font.StringWidth(codes[first+i]));
+   double scale=min(w*0.78/widest,h*0.76/(font.GetHeight()*(1+(rows-1)*1.3)));
+   double lineHeight=font.GetHeight()*scale;
+   double step=lineHeight*1.3;
+   double top=y+(h-(lineHeight+(rows-1)*step))*0.5;
+   for(int i=0;i<rows;i++)
+   {
+    String code=codes[first+i];
+    Label(code,x+(w-font.StringWidth(code)*scale)*0.5,top+i*step,scale);
+   }
+  }
+  if(pages>1)
+  {
+   String pageText=String.Format("%d/%d",page+1,pages);
+   let font=Font.GetFont('GKFont');
+   double scale=h*0.055/font.GetHeight();
+   Label(pageText,x+(w-font.StringWidth(pageText)*scale)*0.5,y+h*0.91,scale);
+  }
+ }
+ override void Drawer()
+ {
+  if(!Handler) return;
+  if(Paper)
+  {
+   double w=min(screen.GetWidth()*0.65,screen.GetHeight()*0.65*740/493.);
+   double h=w*493/740;
+   Sheet(Selection,(screen.GetWidth()-w)/2,(screen.GetHeight()-h)/2,w,h);
+  }
+  else
+  {
+   Layout();
+   Image("graphics/frame.png",X,Y,718*S,928*S);
+   Image("graphics/normal.png",X,Y,718*S,928*S);
+   Image(GreenLit()?"graphics/on.png":"graphics/off.png",X,Y,718*S,928*S);
+   if(Pressed>=0)
+   {
+    int col=Pressed%3, r=Pressed/3;
+    int left=132+col*159,top=196+r*145;
+    Screen.DrawTexture(TexMan.CheckForTexture("graphics/pressed.png"),false,X,Y,
+     DTA_DestWidthF,718*S,DTA_DestHeightF,928*S,DTA_NoOffset,true,
+     DTA_ClipLeft,int(X+left*S),DTA_ClipTop,int(Y+top*S),
+     DTA_ClipRight,int(X+(left+138)*S),DTA_ClipBottom,int(Y+(top+128)*S));
+   }
+
+   Label(Digits,X+275*S,Y+154*S,S);
+   int c=Handler.Doors[Selection].Color;
+   if(Handler.Known[c])
+   {
+    double w=min(screen.GetWidth()*0.29,X-20);
+    if(w>80) Sheet(c,12,screen.GetHeight()-w*493/740-12,w,w*493/740,true);
+   }
+  }
+  Screen.DrawText(SmallFont,Font.CR_WHITE,12,12,"ESC: fechar   Roda do mouse / setas: pagina");
+ }
+ void Button(int n)
+ {
+  if(Paper || Blink>0 || Submitting || n<0 || n>11) return;
+  if(n==9) {Digits="";Pressed=-1;Close();return;}
+  if(n==11)
+  {
+   Submitting=true;
+   EventHandler.SendNetworkEvent("gksubmit",Selection,Digits.Length()==4?Digits.ToInt(10):-1);
+  }
+  else if(Digits.Length()<4) Digits=Digits..(n==10?"0":String.Format("%d",n+1));
+ }
+ int HitButton(int mx,int my)
+ {
+  Layout();
+  double px=(mx-X)/S,py=(my-Y)/S;
+  for(int r=0;r<4;r++) for(int c=0;c<3;c++)
+   if(px>=132+c*159 && px<270+c*159 && py>=196+r*145 && py<324+r*145) return r*3+c;
+  return -1;
+ }
+ bool GreenLit()
+ {
+  if(Blink>0) return ((18-Blink)/3)%2==0;
+  return TapBlink>0;
+ }
+ void BeginPress(int n,bool mouse)
+ {
+  if(Paper || Blink>0 || Submitting || Pressed>=0 || n<0 || n>11) return;
+  Pressed=n;MouseHeld=mouse;TapBlink=5;
+  if(n!=11) S_StartSound("gk/press",CHAN_AUTO,CHANF_UI|CHANF_NOPAUSE,1,ATTN_NONE);
+ }
+ void ReleasePress(int n,bool mouse)
+ {
+  if(Pressed<0 || MouseHeld!=mouse) return;
+  int button=Pressed;Pressed=-1;
+  if(button==n) Button(button);
+ }
+ override bool MouseEvent(int type,int mx,int my)
+ {
+  if(Paper) {if(type==MOUSE_Release) Close();return true;}
+  if(type==MOUSE_Click) BeginPress(HitButton(mx,my),true);
+  if(type==MOUSE_Release) ReleasePress(HitButton(mx,my),true);
+  return true;
+ }
+ int KeyButton(int ch)
+ {
+  if(ch>=49 && ch<=57) return ch-49;
+  if(ch==48) return 10;
+  if(ch==13) return 11;
+  if(ch==120 || ch==88 || ch==8 || ch==26) return 9;
+  return -1;
+ }
+ override bool OnUIEvent(UiEvent e)
+ {
+  if(e.Type==UiEvent.Type_WheelDown) {Page++;return true;}
+  if(e.Type==UiEvent.Type_WheelUp) {Page=max(0,Page-1);return true;}
+  if(!Paper)
+  {
+   int key=KeyButton(e.KeyChar);
+   if(e.Type==UiEvent.Type_KeyDown && key>=0) {BeginPress(key,false);return true;}
+   if(e.Type==UiEvent.Type_KeyUp && key>=0) {ReleasePress(key,false);return true;}
+   if(e.Type==UiEvent.Type_KeyRepeat || e.Type==UiEvent.Type_Char) return true;
+  }
+  return Super.OnUIEvent(e);
+ }
+ override bool MenuEvent(int key,bool controller)
+ {
+  if(key==MKEY_Enter) {if(Paper) Close();else if(controller) {BeginPress(11,false);ReleasePress(11,false);}return true;}
+  if(key==MKEY_Clear) {Digits="";Pressed=-1;Close();return true;}
+  if(key==MKEY_Back) {Digits="";Pressed=-1;}
+  if(key==MKEY_Right || key==MKEY_Down) {Page++;return true;}
+  if(key==MKEY_Left || key==MKEY_Up) {Page=max(0,Page-1);return true;}
+  return Super.MenuEvent(key,controller);
+ }
+ override void Ticker()
+ {
+  if(TapBlink>0) TapBlink--;
+
+  if(!Paper && (!players[consoleplayer].mo || players[consoleplayer].mo.health<=0)) {Close();return;}
+  if(Blink>0 && --Blink==0)
+  {
+
+   Close();
+  }
+ }
+}

@@ -1,0 +1,13 @@
+.tools/
+Backup-Autosave/
+LEIA-ME.md
+TestarSoftware.cmd
+*.pk3
+*.zds
+*.log
+*.ini
+.env
+.env.*
+!.env.example
+artifacts/
+dist/
